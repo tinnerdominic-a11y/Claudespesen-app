@@ -1,0 +1,32 @@
+package ch.expenses.app.export
+
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import java.io.ByteArrayOutputStream
+import java.time.LocalDate
+import java.util.zip.ZipInputStream
+
+class XlsxWriterTest {
+
+    @Test
+    fun writesSheetDrawingAndImages() {
+        val jpeg = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xD9.toByte())
+        val rows = listOf(
+            XlsxRow(LocalDate.of(2026, 10, 14), "Migros & Co <Zürich>", "Food & drinks", 800, "CHF", "", jpeg, 300, 400),
+            XlsxRow(null, "", "", null, "EUR", "unreadable"),
+        )
+        val out = ByteArrayOutputStream()
+        XlsxWriter.write(out, "Expenses October 2026", rows)
+
+        val entries = mutableMapOf<String, String>()
+        ZipInputStream(out.toByteArray().inputStream()).use { zip ->
+            generateSequence { zip.nextEntry }.forEach { entries[it.name] = zip.readBytes().toString(Charsets.UTF_8) }
+        }
+        assertTrue(entries.containsKey("xl/media/image1.jpeg"))
+        assertTrue(entries.containsKey("xl/drawings/drawing1.xml"))
+        val sheet = entries.getValue("xl/worksheets/sheet1.xml")
+        assertTrue(sheet.contains("Migros &amp; Co &lt;Zürich&gt;"))
+        assertTrue(sheet.contains("<v>${LocalDate.of(2026, 10, 14).toEpochDay() + 25569}</v>"))
+        assertTrue(sheet.contains("SUMIF(E3:E4,&quot;CHF&quot;,D3:D4)"))
+    }
+}
