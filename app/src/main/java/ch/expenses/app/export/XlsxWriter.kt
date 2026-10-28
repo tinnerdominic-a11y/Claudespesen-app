@@ -122,10 +122,16 @@ object XlsxWriter {
             append(str("C$r", "Total", STYLE_HEADER))
             fun sumIf(c: String) =
                 if (rows.isEmpty()) "0" else """SUMIF(E$FIRST_DATA_ROW:E$last,"$cur",$c$FIRST_DATA_ROW:$c$last)"""
-            append("""<c r="D$r" s="$STYLE_MONEY_BOLD"><f>${esc(sumIf("D"))}</f></c>""")
+            // The computed value is stored next to the formula so viewers that don't recalculate
+            // (phone previews, mail attachments) still show the totals.
+            val inCurrency = rows.filter { it.currency == cur }
+            val amountSum = inCurrency.sumOf { it.amountCents ?: 0L }
+            append("""<c r="D$r" s="$STYLE_MONEY_BOLD"><f>${esc(sumIf("D"))}</f><v>${amountSum / 100.0}</v></c>""")
             append(str("E$r", cur, STYLE_HEADER))
-            rates.indices.forEach { k ->
-                append("""<c r="${vatCol(k)}$r" s="$STYLE_MONEY_BOLD"><f>${esc(sumIf(vatCol(k)))}</f></c>""")
+            rates.forEachIndexed { k, (abroad, rate) ->
+                val vatSum = inCurrency.filter { it.abroad == abroad }
+                    .sumOf { row -> row.vat.filter { it.rateBp == rate }.sumOf { it.amountCents } }
+                append("""<c r="${vatCol(k)}$r" s="$STYLE_MONEY_BOLD"><f>${esc(sumIf(vatCol(k)))}</f><v>${vatSum / 100.0}</v></c>""")
             }
             append("</row>")
             r++

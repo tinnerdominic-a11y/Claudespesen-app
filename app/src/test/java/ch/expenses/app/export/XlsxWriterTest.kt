@@ -34,6 +34,9 @@ class XlsxWriterTest {
         assertTrue(sheet.contains(">VAT 8.1%<") && sheet.contains(">VAT 2.6%<"))
         assertTrue(sheet.contains("""<c r="H3" s="4"><v>0.2</v></c>"""))
         assertTrue(sheet.contains("SUMIF(E3:E4,&quot;CHF&quot;,G3:G4)"))
+        // Totals carry their computed values for viewers that don't recalculate.
+        assertTrue(sheet.contains("SUMIF(E3:E4,&quot;CHF&quot;,D3:D4)</f><v>8.0</v>"))
+        assertTrue(sheet.contains("SUMIF(E3:E4,&quot;CHF&quot;,H3:H4)</f><v>0.2</v>"))
         assertTrue(entries.getValue("xl/drawings/drawing1.xml").contains("<xdr:col>9</xdr:col>"))
     }
 }
