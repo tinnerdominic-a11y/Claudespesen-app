@@ -109,7 +109,7 @@ object PdfExporter {
             } else {
                 c.drawText("Photo not available", M, area.top + 20, warn)
             }
-            c.drawText("Page $pageNo", W - M - 30, H - 16, small)
+            c.drawText("Page $pageNo", W - M - 30, H - 16f, small)
             doc.finishPage(p)
         }
 
