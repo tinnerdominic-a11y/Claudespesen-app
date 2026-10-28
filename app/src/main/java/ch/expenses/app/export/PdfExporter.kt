@@ -22,6 +22,8 @@ object PdfExporter {
 
     private const val W = 595 // A4 in points
     private const val H = 842
+    private const val SW = 842 // summary pages are landscape
+    private const val SH = 595
     private const val M = 40f
 
     private val title = Paint(Paint.ANTI_ALIAS_FLAG).apply { textSize = 20f; typeface = Typeface.DEFAULT_BOLD }
@@ -37,62 +39,78 @@ object PdfExporter {
         var pageNo = 0
         val monthLabel = month.format(DateTimeFormatter.ofPattern("MMMM yyyy", Locale.getDefault()))
 
-        // --- Summary pages ---
-        val cols = floatArrayOf(M, M + 25, M + 90, M + 260, M + 420) // #, date, merchant, category, VAT (right edge)
+        // --- Summary pages (landscape, one column per VAT rate) ---
+        val vatCols = receipts.flatMap { r -> r.vatLines.map { r.abroad to it.rateBp } }.distinct()
+            .sortedWith(compareBy<Pair<Boolean, Int?>> { it.first }.thenByDescending { it.second ?: -1 })
+        val right = SW - M
+        val amountRight = right
+        val vatW = 64f
+        val vatRight = { k: Int -> amountRight - 80f - (vatCols.size - 1 - k) * vatW }
+        val curX = amountRight - 80f - vatCols.size * vatW - 30f
+        val xNo = M
+        val xDate = M + 22
+        val xMerchant = M + 82
+        val xCategory = maxOf(xMerchant + 120, curX - 95)
         val rowH = 18f
         var page: PdfDocument.Page? = null
         var y = 0f
+        fun vatHeader(k: Int) = vatCols[k].let { (abroad, rate) ->
+            (if (abroad) "Foreign " else "VAT ") + (rate?.let { Vat.formatRate(it) } ?: "")
+        }
         fun newSummaryPage() {
             page?.let(doc::finishPage)
-            page = doc.startPage(PdfDocument.PageInfo.Builder(W, H, ++pageNo).create())
+            page = doc.startPage(PdfDocument.PageInfo.Builder(SW, SH, ++pageNo).create())
             val c = page!!.canvas
-            y = M + 20
+            y = M + 10
             c.drawText("Expenses $monthLabel", M, y, title)
-            y += 30
-            listOf("#", "Date", "Merchant", "Category").forEachIndexed { i, h -> c.drawText(h, cols[i], y, bold) }
-            drawRight(c, "VAT", cols[4], y, bold)
-            drawRight(c, "Amount", W - M, y, bold)
+            y += 28
+            c.drawText("#", xNo, y, bold)
+            c.drawText("Date", xDate, y, bold)
+            c.drawText("Merchant", xMerchant, y, bold)
+            c.drawText("Category", xCategory, y, bold)
+            c.drawText("Cur.", curX, y, bold)
+            vatCols.indices.forEach { k -> drawRight(c, vatHeader(k), vatRight(k), y, bold) }
+            drawRight(c, "Amount", amountRight, y, bold)
             y += 6
-            c.drawLine(M, y, W - M, y, line)
+            c.drawLine(M, y, right, y, line)
             y += rowH - 4
         }
         newSummaryPage()
         receipts.forEachIndexed { i, r ->
-            if (y > H - M - 60) newSummaryPage()
+            if (y > SH - M - 30) newSummaryPage()
             val c = page!!.canvas
-            c.drawText("${i + 1}", cols[0], y, text)
-            c.drawText(r.date?.format(ReceiptParser.displayDate) ?: "–", cols[1], y, text)
+            c.drawText("${i + 1}", xNo, y, text)
+            c.drawText(r.date?.format(ReceiptParser.displayDate) ?: "–", xDate, y, text)
             val merchant = r.merchant.ifBlank { "(unknown)" } + if (r.abroad) " (abroad)" else ""
-            c.drawText(ellipsize(merchant, text, cols[3] - cols[2] - 8), cols[2], y, text)
-            c.drawText(ellipsize(r.category, text, cols[4] - cols[3] - 60), cols[3], y, text)
-            r.vatLines.takeIf { it.isNotEmpty() }?.let { v ->
-                drawRight(c, ReceiptParser.formatAmount(v.sumOf { it.amountCents }), cols[4], y, text)
+            c.drawText(ellipsize(merchant, text, xCategory - xMerchant - 8), xMerchant, y, text)
+            c.drawText(ellipsize(r.category, text, curX - xCategory - 8), xCategory, y, text)
+            c.drawText(r.currency, curX, y, text)
+            vatCols.forEachIndexed { k, (abroad, rate) ->
+                val matching = r.vatLines.filter { it.rateBp == rate }
+                if (r.abroad == abroad && matching.isNotEmpty()) {
+                    drawRight(c, ReceiptParser.formatAmount(matching.sumOf { it.amountCents }), vatRight(k), y, text)
+                }
             }
-            drawRight(c, amountLabel(r), W - M, y, if (r.amountCents == null) warn else text)
+            drawRight(c, r.amountCents?.let(ReceiptParser::formatAmount) ?: "missing", amountRight, y,
+                if (r.amountCents == null) warn else text)
             y += 4
-            c.drawLine(M, y, W - M, y, line)
+            c.drawLine(M, y, right, y, line)
             y += rowH - 4
         }
-        if (y > H - M - 60) newSummaryPage()
-        y += 8
-        val totals = receipts.filter { it.amountCents != null }.groupBy { it.currency }
-            .mapValues { (_, list) -> list.sumOf { it.amountCents!! } }
-        page!!.canvas.drawText("${receipts.size} receipts", M, y, bold)
-        totals.toSortedMap().forEach { (cur, sum) ->
-            drawRight(page!!.canvas, "Total $cur ${ReceiptParser.formatAmount(sum)}", W - M, y, bold)
+        // Totals per currency, with each VAT column summed (Swiss and foreign VAT kept apart).
+        receipts.groupBy { it.currency }.toSortedMap().forEach { (cur, list) ->
+            if (y > SH - M - 30) newSummaryPage()
+            val c = page!!.canvas
+            y += 4
+            c.drawText("Total $cur (${list.size} receipts)", xMerchant, y, bold)
+            c.drawText(cur, curX, y, bold)
+            vatCols.forEachIndexed { k, (abroad, rate) ->
+                val sum = list.filter { it.abroad == abroad }.flatMap { it.vatLines }.filter { it.rateBp == rate }
+                drawRight(c, ReceiptParser.formatAmount(sum.sumOf { it.amountCents }), vatRight(k), y, bold)
+            }
+            drawRight(c, ReceiptParser.formatAmount(list.sumOf { it.amountCents ?: 0L }), amountRight, y, bold)
             y += rowH
         }
-        // VAT totals per rate and currency, Swiss first; foreign VAT can't go into the Swiss VAT return.
-        data class VatKey(val abroad: Boolean, val currency: String, val rateBp: Int?)
-        receipts.flatMap { r -> r.vatLines.map { VatKey(r.abroad, r.currency, it.rateBp) to it.amountCents } }
-            .groupBy({ it.first }, { it.second })
-            .toSortedMap(compareBy<VatKey>({ it.abroad }, { it.currency }).thenByDescending { it.rateBp ?: -1 })
-            .forEach { (key, amounts) ->
-                if (y > H - M - 20) newSummaryPage()
-                val label = (if (key.abroad) "Foreign VAT" else "VAT") + (key.rateBp?.let { " " + Vat.formatRate(it) } ?: "")
-                drawRight(page!!.canvas, "$label ${key.currency} ${ReceiptParser.formatAmount(amounts.sum())}", W - M, y, text)
-                y += rowH
-            }
         val missing = receipts.count { it.amountCents == null }
         if (missing > 0) page!!.canvas.drawText("$missing receipt(s) without an amount", M, y + 4, warn)
         doc.finishPage(page!!)
