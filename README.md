@@ -20,9 +20,12 @@ All data stays on the phone (Room database + photos in app-private storage).
 
 ## Install
 
-Download `app-release.apk` from the latest **Build APK** run in GitHub Actions
-(Actions tab → latest run → Artifacts → `receipts-apk`), unzip it, copy it to the phone and open it.
-Android will ask you to allow installing apps from that source.
+On the phone, open this link in the browser and install the downloaded file:
+
+https://github.com/tinnerdominic-a11y/Claudespesen-app/releases/latest/download/Receipts.apk
+
+Android will ask once to allow installing apps from the browser. Every change pushed to `main`
+publishes a new release; installing it updates the app and keeps your receipts.
 
 ## Build locally
 

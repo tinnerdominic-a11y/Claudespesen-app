@@ -13,15 +13,28 @@ android {
         applicationId = "ch.expenses.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        // CI passes its run number so every build installs as an update over the previous one.
+        val build = System.getenv("BUILD_NUMBER")?.toIntOrNull() ?: 1
+        versionCode = build
+        versionName = "1.0.$build"
+    }
+
+    // CI writes the key from the RECEIPTS_KEYSTORE_BASE64 secret, so every build has the same
+    // signature and installs as an update. Without it, the debug key is used.
+    val keystore = file("receipts.keystore")
+    if (keystore.exists()) {
+        signingConfigs.create("release") {
+            storeFile = keystore
+            storePassword = System.getenv("RECEIPTS_KEYSTORE_PASSWORD")
+            keyAlias = "receipts"
+            keyPassword = System.getenv("RECEIPTS_KEYSTORE_PASSWORD")
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
-            // Signed with the debug key so the release APK installs directly.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
     }
     compileOptions {
