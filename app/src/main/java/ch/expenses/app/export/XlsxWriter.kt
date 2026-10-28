@@ -1,5 +1,7 @@
 package ch.expenses.app.export
 
+import ch.expenses.app.ocr.Vat
+import ch.expenses.app.ocr.VatLine
 import java.io.OutputStream
 import java.time.LocalDate
 import java.util.zip.ZipEntry
@@ -13,6 +15,9 @@ class XlsxRow(
     val amountCents: Long?,
     val currency: String,
     val note: String,
+    /** VAT per rate (basis points, null = unknown rate) in cents. */
+    val vat: List<VatLine> = emptyList(),
+    val abroad: Boolean = false,
     val image: ByteArray? = null,
     val imageWidth: Int = 0,
     val imageHeight: Int = 0,
@@ -20,11 +25,11 @@ class XlsxRow(
 
 /**
  * Minimal .xlsx writer (no Apache POI, which is huge on Android): a single sheet with a title,
- * header, one row per receipt with the photo embedded next to it, and SUMIF totals per currency.
+ * header, one row per receipt with VAT per rate and the photo embedded next to it, and SUMIF
+ * totals per currency.
  */
 object XlsxWriter {
 
-    private const val PHOTO_COL = 6 // column G, 0-based
     private const val PHOTO_ROW_PT = 160.0
     private const val PHOTO_MAX_H_PT = 150.0
     private const val PHOTO_MAX_W_PT = 230.0
@@ -42,7 +47,7 @@ object XlsxWriter {
             put("xl/worksheets/sheet1.xml", sheet(title, rows, images.isNotEmpty()))
             if (images.isNotEmpty()) {
                 put("xl/worksheets/_rels/sheet1.xml.rels", SHEET_RELS)
-                put("xl/drawings/drawing1.xml", drawing(images))
+                put("xl/drawings/drawing1.xml", drawing(images, photoCol(rows)))
                 put("xl/drawings/_rels/drawing1.xml.rels", drawingRels(images.size))
                 images.forEachIndexed { n, (_, row) -> put(zip, "xl/media/image${n + 1}.jpeg", row.image!!) }
             }
@@ -58,21 +63,38 @@ object XlsxWriter {
     // Sheet rows (1-based): 1 title, 2 header, 3.. data.
     private const val FIRST_DATA_ROW = 3
 
+    /**
+     * VAT columns: one per rate found this month (highest first, null = no rate), Swiss first and
+     * then foreign VAT in its own columns, since only Swiss VAT goes into the Swiss VAT return.
+     */
+    private fun vatColumns(rows: List<XlsxRow>): List<Pair<Boolean, Int?>> =
+        rows.flatMap { r -> r.vat.map { r.abroad to it.rateBp } }.distinct()
+            .sortedWith(compareBy<Pair<Boolean, Int?>> { it.first }.thenByDescending { it.second ?: -1 })
+
+    private const val FIRST_VAT_COL = 6 // after Date, Merchant, Category, Amount, Currency, Abroad
+
+    private fun photoCol(rows: List<XlsxRow>) = FIRST_VAT_COL + vatColumns(rows).size + 1 // after the note
+
     private fun sheet(title: String, rows: List<XlsxRow>, hasImages: Boolean): String = buildString {
+        val rates = vatColumns(rows)
+        val vatCol = { k: Int -> col(FIRST_VAT_COL + k) }
+        val noteCol = col(FIRST_VAT_COL + rates.size)
         append("""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>""")
         append("""<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">""")
         append("""<sheetPr><pageSetUpPr fitToPage="1"/></sheetPr>""")
         append("""<sheetViews><sheetView workbookViewId="0"><pane ySplit="2" topLeftCell="A3" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>""")
         append("<cols>")
-        listOf(12, 30, 18, 12, 9, 30, 34).forEachIndexed { i, w ->
+        (listOf(12, 30, 18, 12, 9, 8) + rates.map { if (it.first) 17 else 11 } + listOf(30, 34)).forEachIndexed { i, w ->
             append("""<col min="${i + 1}" max="${i + 1}" width="$w" customWidth="1"/>""")
         }
         append("</cols><sheetData>")
         append("""<row r="1">${str("A1", title, STYLE_TITLE)}</row>""")
         append("""<row r="2">""")
-        listOf("Date", "Merchant", "Category", "Amount", "Currency", "Note", "Photo").forEachIndexed { i, h ->
-            append(str("${col(i)}2", h, STYLE_HEADER))
-        }
+        val headers = listOf("Date", "Merchant", "Category", "Amount", "Currency", "Abroad") +
+            rates.map { (abroad, rate) ->
+                (if (abroad) "Foreign VAT" else "VAT") + (rate?.let { " " + Vat.formatRate(it) } ?: "")
+            } + listOf("Note", "Photo")
+        headers.forEachIndexed { i, h -> append(str("${col(i)}2", h, STYLE_HEADER)) }
         append("</row>")
         rows.forEachIndexed { i, row ->
             val r = FIRST_DATA_ROW + i
@@ -83,7 +105,14 @@ object XlsxWriter {
             append(str("C$r", row.category, STYLE_TEXT))
             row.amountCents?.let { append("""<c r="D$r" s="$STYLE_MONEY"><v>${it / 100.0}</v></c>""") }
             append(str("E$r", row.currency, STYLE_TEXT))
-            append(str("F$r", row.note, STYLE_TEXT))
+            if (row.abroad) append(str("F$r", "Yes", STYLE_TEXT))
+            rates.forEachIndexed { k, (abroad, rate) ->
+                val cents = row.vat.filter { it.rateBp == rate }.sumOf { it.amountCents }
+                if (row.abroad == abroad && row.vat.any { it.rateBp == rate }) {
+                    append("""<c r="${vatCol(k)}$r" s="$STYLE_MONEY"><v>${cents / 100.0}</v></c>""")
+                }
+            }
+            append(str("$noteCol$r", row.note, STYLE_TEXT))
             append("</row>")
         }
         val last = FIRST_DATA_ROW + rows.size - 1
@@ -91,9 +120,13 @@ object XlsxWriter {
         rows.map { it.currency }.distinct().sorted().forEach { cur ->
             append("""<row r="$r">""")
             append(str("C$r", "Total", STYLE_HEADER))
-            val formula = if (rows.isEmpty()) "0" else """SUMIF(E$FIRST_DATA_ROW:E$last,"$cur",D$FIRST_DATA_ROW:D$last)"""
-            append("""<c r="D$r" s="$STYLE_MONEY_BOLD"><f>${esc(formula)}</f></c>""")
+            fun sumIf(c: String) =
+                if (rows.isEmpty()) "0" else """SUMIF(E$FIRST_DATA_ROW:E$last,"$cur",$c$FIRST_DATA_ROW:$c$last)"""
+            append("""<c r="D$r" s="$STYLE_MONEY_BOLD"><f>${esc(sumIf("D"))}</f></c>""")
             append(str("E$r", cur, STYLE_HEADER))
+            rates.indices.forEach { k ->
+                append("""<c r="${vatCol(k)}$r" s="$STYLE_MONEY_BOLD"><f>${esc(sumIf(vatCol(k)))}</f></c>""")
+            }
             append("</row>")
             r++
         }
@@ -103,7 +136,7 @@ object XlsxWriter {
         append("</worksheet>")
     }
 
-    private fun drawing(images: List<IndexedValue<XlsxRow>>): String = buildString {
+    private fun drawing(images: List<IndexedValue<XlsxRow>>, photoCol: Int): String = buildString {
         append("""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>""")
         append("""<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">""")
         images.forEachIndexed { n, (rowIndex, row) ->
@@ -116,7 +149,7 @@ object XlsxWriter {
             val sheetRow0 = FIRST_DATA_ROW - 1 + rowIndex // 0-based for drawings
             val id = n + 1
             append("<xdr:oneCellAnchor>")
-            append("""<xdr:from><xdr:col>$PHOTO_COL</xdr:col><xdr:colOff>38100</xdr:colOff><xdr:row>$sheetRow0</xdr:row><xdr:rowOff>38100</xdr:rowOff></xdr:from>""")
+            append("""<xdr:from><xdr:col>$photoCol</xdr:col><xdr:colOff>38100</xdr:colOff><xdr:row>$sheetRow0</xdr:row><xdr:rowOff>38100</xdr:rowOff></xdr:from>""")
             append("""<xdr:ext cx="$cx" cy="$cy"/>""")
             append("""<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="${id + 1}" name="Receipt $id"/><xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr>""")
             append("""<xdr:blipFill><a:blip r:embed="rId$id"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>""")

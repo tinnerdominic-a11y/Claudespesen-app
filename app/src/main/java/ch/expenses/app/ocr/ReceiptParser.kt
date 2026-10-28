@@ -10,6 +10,9 @@ data class ParsedReceipt(
     val date: LocalDate?,
     val totalCents: Long?,
     val currency: String?,
+    val vat: List<VatLine> = emptyList(),
+    /** Probably from outside Switzerland; see [Vat.isLikelyForeign]. */
+    val abroad: Boolean = false,
 )
 
 /**
@@ -28,6 +31,7 @@ object ReceiptParser {
         "mwst", "mwst.", "tva", "iva", "vat", "steuer", "zwischensumme", "subtotal", "sous-total",
         "rückgeld", "rueckgeld", "retour", "change", "rabatt", "discount", "netto",
     )
+    private val inclusiveRegex = Regex("""\b(inkl|incl|including|inclus|compris|ttc)\b""")
     private val merchantSkip = listOf(
         "quittung", "beleg", "kassenbon", "receipt", "rechnung", "facture", "ricevuta", "kasse",
         "tel", "tel.", "www", "http", "mwst", "uid", "che-", "datum", "date", "willkommen",
@@ -56,11 +60,16 @@ object ReceiptParser {
 
     fun parse(text: String, today: LocalDate = LocalDate.now()): ParsedReceipt {
         val lines = text.lines().map { it.trim() }.filter { it.isNotEmpty() }
+        val total = findTotal(lines)
+        val currency = findCurrency(text)
+        val vat = Vat.parse(lines, total)
         return ParsedReceipt(
             merchant = findMerchant(lines),
             date = findDate(lines, today),
-            totalCents = findTotal(lines),
-            currency = findCurrency(text),
+            totalCents = total,
+            currency = currency,
+            vat = vat,
+            abroad = Vat.isLikelyForeign(currency, vat, text),
         )
     }
 
@@ -113,7 +122,8 @@ object ReceiptParser {
         // 1) A line with a total keyword (or the line right after it, when the amount is on its own line).
         for ((i, line) in lines.withIndex()) {
             val lower = line.lowercase()
-            if (excludeKeywords.any { lower.contains(it) }) continue
+            val inclusive = inclusiveRegex.containsMatchIn(lower) // "Total inkl. MWST 12.50"
+            if (!inclusive && excludeKeywords.any { lower.contains(it) }) continue
             if (totalKeywords.none { Regex("""(^|[^a-zäöüéà])${Regex.escape(it)}([^a-zäöüéà]|$)""").containsMatchIn(lower) }) continue
             val amounts = amountsIn(line)
             if (amounts.isNotEmpty()) return amounts.last()
@@ -128,10 +138,11 @@ object ReceiptParser {
     }
 
     fun amountsIn(line: String): List<Long> {
-        // Skip things that look like dates or times so 12.05.2024 isn't read as 12.05.
+        // Skip dates, times and percentages so 12.05.2024 or 7.70% aren't read as amounts.
         val cleaned = line
             .replace(Regex("""\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b"""), " ")
             .replace(Regex("""\b\d{1,2}:\d{2}(:\d{2})?\b"""), " ")
+            .replace(Regex("""\d{1,2}(?:[.,]\d{1,2})?\s?%"""), " ") // percentages like 7.70%
         return amountRegex.findAll(cleaned).mapNotNull { m ->
             val whole = m.groupValues[1].replace(Regex("""['’.,]"""), "").toLongOrNull()
                 ?: return@mapNotNull null

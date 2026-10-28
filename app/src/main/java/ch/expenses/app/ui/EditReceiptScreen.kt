@@ -17,6 +17,8 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DateRange
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.AlertDialog
@@ -36,6 +38,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.MenuAnchorType
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -43,6 +46,7 @@ import androidx.compose.material3.rememberDatePickerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -63,6 +67,8 @@ import ch.expenses.app.data.Receipt
 import ch.expenses.app.data.ReceiptRepository
 import ch.expenses.app.ocr.ReceiptParser
 import ch.expenses.app.ocr.ReceiptScanner
+import ch.expenses.app.ocr.Vat
+import ch.expenses.app.ocr.VatLine
 import coil.compose.AsyncImage
 import kotlinx.coroutines.launch
 import java.io.File
@@ -76,16 +82,37 @@ private class Form {
     var currency by mutableStateOf("CHF")
     var category by mutableStateOf("")
     var note by mutableStateOf("")
+    var abroad by mutableStateOf(false)
+    val vat = mutableStateListOf<VatRow>()
+
+    fun setVat(lines: List<VatLine>) {
+        vat.clear()
+        lines.forEach { l ->
+            vat += VatRow(l.rateBp?.let { Vat.formatRate(it).removeSuffix("%") } ?: "", plainAmount(l.amountCents))
+        }
+    }
 
     companion object {
         val Saver = listSaver<Form, String>(
-            save = { listOf(it.merchant, it.date, it.amount, it.currency, it.category, it.note) },
+            save = {
+                listOf(it.merchant, it.date, it.amount, it.currency, it.category, it.note, it.abroad.toString()) +
+                    it.vat.map { r -> "${r.rate}\t${r.amount}" }
+            },
             restore = { v ->
-                Form().apply { merchant = v[0]; date = v[1]; amount = v[2]; currency = v[3]; category = v[4]; note = v[5] }
+                Form().apply {
+                    merchant = v[0]; date = v[1]; amount = v[2]; currency = v[3]; category = v[4]; note = v[5]
+                    abroad = v[6].toBoolean()
+                    v.drop(7).forEach { row -> row.split('\t').let { vat += VatRow(it[0], it.getOrElse(1) { "" }) } }
+                }
             },
         )
     }
 }
+
+/** A VAT line as typed: rate in percent ("8.1") and amount ("0.92"), both may be blank. */
+private data class VatRow(val rate: String, val amount: String)
+
+private fun plainAmount(cents: Long) = ReceiptParser.formatAmount(cents).replace("'", "")
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -127,6 +154,8 @@ fun EditReceiptScreen(
                 form.currency = r.currency
                 form.category = r.category
                 form.note = r.note
+                form.setVat(r.vatLines)
+                form.abroad = r.abroad
             }
         } else if (newPhotoPath != null) {
             val text = ReceiptScanner(context).readText(File(newPhotoPath))
@@ -136,6 +165,8 @@ fun EditReceiptScreen(
             form.date = (parsed.date ?: LocalDate.now()).format(ReceiptParser.displayDate)
             form.amount = parsed.totalCents?.let { ReceiptParser.formatAmount(it).replace("'", "") } ?: ""
             form.currency = parsed.currency ?: "CHF"
+            form.setVat(parsed.vat)
+            form.abroad = parsed.abroad
             unread = buildList {
                 if (parsed.merchant == null) add("company")
                 if (parsed.date == null) add("date (set to today)")
@@ -156,10 +187,24 @@ fun EditReceiptScreen(
     val date = ReceiptParser.parseUserDate(form.date)
     val amountError = form.amount.isNotBlank() && amountCents == null
     val dateError = form.date.isNotBlank() && date == null
+    val vatRates = form.vat.map { if (it.rate.isBlank()) null else Vat.parseRate(it.rate) }
+    val vatAmounts = form.vat.map { ReceiptParser.parseUserAmount(it.amount) }
+    val vatRateErrors = form.vat.mapIndexed { i, r -> r.rate.isNotBlank() && vatRates[i] == null }
+    val vatAmountErrors = form.vat.mapIndexed { i, r -> r.amount.isNotBlank() && vatAmounts[i] == null }
+    // With a single rate and no amount typed, the VAT is worked out from the total.
+    fun autoVat(i: Int): Long? {
+        val rate = vatRates[i] ?: return null
+        if (rate == 0) return 0
+        if (form.vat.size != 1 || amountCents == null) return null
+        return Vat.fromGross(amountCents, rate)
+    }
 
     fun save() {
         triedSave = true
-        if (amountError || dateError) return
+        if (amountError || dateError || vatRateErrors.any { it } || vatAmountErrors.any { it }) return
+        val vatLines = form.vat.indices.mapNotNull { i ->
+            (vatAmounts[i] ?: autoVat(i))?.let { VatLine(vatRates[i], it) }
+        }
         val base = original ?: Receipt(imagePath = imagePath)
         scope.launch {
             repository.save(
@@ -170,6 +215,8 @@ fun EditReceiptScreen(
                     currency = form.currency,
                     category = form.category,
                     note = form.note.trim(),
+                    vat = Vat.encode(vatLines),
+                    abroad = form.abroad,
                     ocrText = ocrText,
                 )
             )
@@ -257,6 +304,23 @@ fun EditReceiptScreen(
                 )
                 Picker("Currency", form.currency, CURRENCIES, Modifier.weight(0.7f)) { form.currency = it }
             }
+
+            Row(
+                Modifier.fillMaxWidth().clickable { form.abroad = !form.abroad },
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("Receipt from abroad", style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        "Foreign VAT is listed separately in exports",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(checked = form.abroad, onCheckedChange = { form.abroad = it })
+            }
+
+            VatSection(form, vatRateErrors, vatAmountErrors, ::autoVat)
 
             OutlinedTextField(
                 value = form.date,
@@ -351,6 +415,82 @@ private fun Picker(label: String, value: String, options: List<String>, modifier
         ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
             options.forEach { option ->
                 DropdownMenuItem(text = { Text(option) }, onClick = { onPick(option); expanded = false })
+            }
+        }
+    }
+}
+
+@Composable
+private fun VatSection(
+    form: Form,
+    rateErrors: List<Boolean>,
+    amountErrors: List<Boolean>,
+    autoVat: (Int) -> Long?,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("VAT", style = MaterialTheme.typography.titleSmall)
+        if (form.vat.isEmpty()) {
+            Text(
+                "No VAT found on the receipt.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        form.vat.forEachIndexed { i, row ->
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                RateField(row.rate, rateErrors.getOrElse(i) { false }, Modifier.weight(1f)) {
+                    form.vat[i] = row.copy(rate = it)
+                }
+                OutlinedTextField(
+                    value = row.amount,
+                    onValueChange = { form.vat[i] = row.copy(amount = it) },
+                    label = { Text("VAT amount") },
+                    placeholder = autoVat(i)?.let { auto -> { Text(plainAmount(auto)) } },
+                    singleLine = true,
+                    isError = amountErrors.getOrElse(i) { false },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    modifier = Modifier.weight(1.2f),
+                )
+                IconButton(onClick = { form.vat.removeAt(i) }) {
+                    Icon(Icons.Default.Close, contentDescription = "Remove VAT line")
+                }
+            }
+        }
+        Row {
+            TextButton(onClick = { form.vat += VatRow(if (form.vat.isEmpty()) "8.1" else "", "") }) {
+                Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.padding(end = 4.dp))
+                Text("Add VAT rate")
+            }
+            TextButton(onClick = { form.vat.clear(); form.vat += VatRow("0", "0.00") }) {
+                Text("0% VAT / import")
+            }
+        }
+    }
+}
+
+/** Rate in percent, typed freely or picked from the common Swiss/EU rates. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun RateField(value: String, isError: Boolean, modifier: Modifier, onChange: (String) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }, modifier = modifier) {
+        OutlinedTextField(
+            value = value,
+            onValueChange = onChange,
+            label = { Text("Rate") },
+            suffix = { Text("%") },
+            singleLine = true,
+            isError = isError,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
+            modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryEditable).fillMaxWidth(),
+        )
+        ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            Vat.COMMON_RATES_BP.forEach { bp ->
+                DropdownMenuItem(
+                    text = { Text(if (bp == 0) "0% (exempt / import)" else Vat.formatRate(bp)) },
+                    onClick = { onChange(Vat.formatRate(bp).removeSuffix("%")); expanded = false },
+                )
             }
         }
     }

@@ -24,6 +24,8 @@ object ExcelExporter {
                 amountCents = r.amountCents,
                 currency = r.currency,
                 note = r.note,
+                vat = r.vatLines,
+                abroad = r.abroad,
                 image = jpeg,
                 imageWidth = bmp?.width ?: 0,
                 imageHeight = bmp?.height ?: 0,

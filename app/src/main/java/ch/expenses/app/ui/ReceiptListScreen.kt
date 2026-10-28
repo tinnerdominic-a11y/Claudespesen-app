@@ -220,7 +220,11 @@ private fun ReceiptRow(r: Receipt, onClick: () -> Unit) {
                     overflow = TextOverflow.Ellipsis,
                 )
                 Text(
-                    listOfNotNull(r.date?.format(ReceiptParser.displayDate), r.category.ifBlank { null }).joinToString(" · ")
+                    listOfNotNull(
+                        r.date?.format(ReceiptParser.displayDate),
+                        r.category.ifBlank { null },
+                        "Abroad".takeIf { r.abroad },
+                    ).joinToString(" · ")
                         .ifBlank { "No date" },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,

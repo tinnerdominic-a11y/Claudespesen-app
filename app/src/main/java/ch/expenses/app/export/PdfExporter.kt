@@ -8,6 +8,7 @@ import android.graphics.Typeface
 import android.graphics.pdf.PdfDocument
 import ch.expenses.app.data.Receipt
 import ch.expenses.app.ocr.ReceiptParser
+import ch.expenses.app.ocr.Vat
 import java.io.File
 import java.time.YearMonth
 import java.time.format.DateTimeFormatter
@@ -37,7 +38,7 @@ object PdfExporter {
         val monthLabel = month.format(DateTimeFormatter.ofPattern("MMMM yyyy", Locale.getDefault()))
 
         // --- Summary pages ---
-        val cols = floatArrayOf(M, M + 30, M + 100, M + 290, M + 400) // #, date, merchant, category, amount
+        val cols = floatArrayOf(M, M + 25, M + 90, M + 260, M + 420) // #, date, merchant, category, VAT (right edge)
         val rowH = 18f
         var page: PdfDocument.Page? = null
         var y = 0f
@@ -48,7 +49,9 @@ object PdfExporter {
             y = M + 20
             c.drawText("Expenses $monthLabel", M, y, title)
             y += 30
-            listOf("#", "Date", "Merchant", "Category", "Amount").forEachIndexed { i, h -> c.drawText(h, cols[i], y, bold) }
+            listOf("#", "Date", "Merchant", "Category").forEachIndexed { i, h -> c.drawText(h, cols[i], y, bold) }
+            drawRight(c, "VAT", cols[4], y, bold)
+            drawRight(c, "Amount", W - M, y, bold)
             y += 6
             c.drawLine(M, y, W - M, y, line)
             y += rowH - 4
@@ -59,8 +62,12 @@ object PdfExporter {
             val c = page!!.canvas
             c.drawText("${i + 1}", cols[0], y, text)
             c.drawText(r.date?.format(ReceiptParser.displayDate) ?: "–", cols[1], y, text)
-            c.drawText(ellipsize(r.merchant.ifBlank { "(unknown)" }, text, cols[3] - cols[2] - 8), cols[2], y, text)
-            c.drawText(ellipsize(r.category, text, cols[4] - cols[3] - 8), cols[3], y, text)
+            val merchant = r.merchant.ifBlank { "(unknown)" } + if (r.abroad) " (abroad)" else ""
+            c.drawText(ellipsize(merchant, text, cols[3] - cols[2] - 8), cols[2], y, text)
+            c.drawText(ellipsize(r.category, text, cols[4] - cols[3] - 60), cols[3], y, text)
+            r.vatLines.takeIf { it.isNotEmpty() }?.let { v ->
+                drawRight(c, ReceiptParser.formatAmount(v.sumOf { it.amountCents }), cols[4], y, text)
+            }
             drawRight(c, amountLabel(r), W - M, y, if (r.amountCents == null) warn else text)
             y += 4
             c.drawLine(M, y, W - M, y, line)
@@ -75,6 +82,17 @@ object PdfExporter {
             drawRight(page!!.canvas, "Total $cur ${ReceiptParser.formatAmount(sum)}", W - M, y, bold)
             y += rowH
         }
+        // VAT totals per rate and currency, Swiss first; foreign VAT can't go into the Swiss VAT return.
+        data class VatKey(val abroad: Boolean, val currency: String, val rateBp: Int?)
+        receipts.flatMap { r -> r.vatLines.map { VatKey(r.abroad, r.currency, it.rateBp) to it.amountCents } }
+            .groupBy({ it.first }, { it.second })
+            .toSortedMap(compareBy<VatKey>({ it.abroad }, { it.currency }).thenByDescending { it.rateBp ?: -1 })
+            .forEach { (key, amounts) ->
+                if (y > H - M - 20) newSummaryPage()
+                val label = (if (key.abroad) "Foreign VAT" else "VAT") + (key.rateBp?.let { " " + Vat.formatRate(it) } ?: "")
+                drawRight(page!!.canvas, "$label ${key.currency} ${ReceiptParser.formatAmount(amounts.sum())}", W - M, y, text)
+                y += rowH
+            }
         val missing = receipts.count { it.amountCents == null }
         if (missing > 0) page!!.canvas.drawText("$missing receipt(s) without an amount", M, y + 4, warn)
         doc.finishPage(page!!)
@@ -90,8 +108,16 @@ object PdfExporter {
                 add("Date: " + (r.date?.format(ReceiptParser.displayDate) ?: "–"))
                 add("Amount: " + amountLabel(r))
                 if (r.category.isNotBlank()) add("Category: ${r.category}")
+                if (r.abroad) add("From abroad")
             }.joinToString("     ")
             c.drawText(details, M, ty, text)
+            if (r.vatLines.isNotEmpty()) {
+                ty += 14
+                val vat = r.vatLines.joinToString("   ") { v ->
+                    (v.rateBp?.let { Vat.formatRate(it) + " " } ?: "") + "${r.currency} ${ReceiptParser.formatAmount(v.amountCents)}"
+                }
+                c.drawText((if (r.abroad) "Foreign VAT: " else "VAT: ") + vat, M, ty, text)
+            }
             if (r.note.isNotBlank()) {
                 ty += 14
                 c.drawText(ellipsize("Note: ${r.note}", text, W - 2 * M), M, ty, text)
